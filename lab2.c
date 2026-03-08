@@ -1,6 +1,9 @@
+cd ~/lab2
+cat > lab2.c <<'EOF'
 /*
+ *
  * CSEE 4840 Lab 2
- * Name/UNI: (Fill your names here)
+ * Name/UNI: Xiao Lu (xl3586), Handong He (hh3152), Teresa Co (tc3499)
  */
 
 #include "fbputchar.h"
@@ -28,7 +31,7 @@
 #define INPUT_END_ROW   (MAX_ROWS - 1)
 #define SEPARATOR_ROW   (INPUT_START_ROW - 1)
 
-#define RECV_START_ROW  0
+#define RECV_START_ROW  1
 #define RECV_END_ROW    (SEPARATOR_ROW - 1)
 #define RECV_ROWS       (RECV_END_ROW - RECV_START_ROW + 1)
 
@@ -99,6 +102,14 @@ static void clear_region(int r0, int r1)
             fbputchar(' ', r, c);
 }
 
+static void draw_borders(void)
+{
+    for (int col = 0; col < MAX_COLS; col++) {
+        fbputchar('*', 0, col);
+        fbputchar('*', MAX_ROWS - 1, col);
+    }
+}
+
 static void draw_separator(void)
 {
     for (int c = 0; c < MAX_COLS; c++)
@@ -152,8 +163,7 @@ static void redraw_input(void)
 /* ================= RECEIVE ================= */
 static void recv_scroll_up(void)
 {
-    memmove(recv_buf[0], recv_buf[1],
-            (RECV_ROWS - 1) * MAX_COLS);
+    memmove(recv_buf[0], recv_buf[1], (RECV_ROWS - 1) * MAX_COLS);
     memset(recv_buf[RECV_ROWS - 1], ' ', MAX_COLS);
     if (recv_row > 0)
         recv_row--;
@@ -186,8 +196,8 @@ static void recv_putc_buf(char c)
 /* ================= INPUT ================= */
 static void insert_char(char c)
 {
-    if (input_len >= INPUT_BUFFER_SIZE - 1)
-        return;
+    if (input_len >= VIEW_CAP) return;
+    if (input_len >= INPUT_BUFFER_SIZE - 1) return;
 
     for (int i = input_len; i > cursor_pos; i--)
         input_buf[i] = input_buf[i - 1];
@@ -199,8 +209,7 @@ static void insert_char(char c)
 
 static void backspace_char(void)
 {
-    if (cursor_pos <= 0)
-        return;
+    if (cursor_pos <= 0) return;
 
     for (int i = cursor_pos - 1; i < input_len - 1; i++)
         input_buf[i] = input_buf[i + 1];
@@ -218,34 +227,120 @@ static void clear_input(void)
 
 static void send_msg(void)
 {
-    if (input_len <= 0)
-        return;
+    if (input_len <= 0) return;
 
     write(sockfd, input_buf, input_len);
     write(sockfd, "\n", 1);
     clear_input();
 }
 
+/* ================= PROMPT FILTER ================= */
+/* Match "<d{1,3}.d{1,3}.d{1,3}.d{1,3}:d{1,5}>", lightweight. */
+static int is_ip_prompt(const char *s, int n, int *consumed)
+{
+    int i = 0;
+    if (n <= 0 || s[i] != '<') return 0;
+    i++;
+
+    for (int part = 0; part < 4; part++) {
+        int digits = 0;
+        while (i < n && s[i] >= '0' && s[i] <= '9') { i++; digits++; }
+        if (digits == 0 || digits > 3) return 0;
+
+        if (part < 3) {
+            if (i >= n || s[i] != '.') return 0;
+            i++;
+        }
+    }
+
+    if (i >= n || s[i] != ':') return 0;
+    i++;
+
+    int digits = 0;
+    while (i < n && s[i] >= '0' && s[i] <= '9') { i++; digits++; }
+    if (digits == 0 || digits > 5) return 0;
+
+    if (i >= n || s[i] != '>') return 0;
+    i++;
+
+    *consumed = i;
+    return 1;
+}
+
 /* ================= NETWORK ================= */
 static void *net_thread(void *arg)
 {
+    (void)arg;
     char buf[256];
 
+    static int line_start = 1; /* persists across read() */
+    static int skip_nl = 0;    /* swallow CR/LF after dropping a prompt, even across reads */
+
     while (1) {
-        int n = read(sockfd, buf, sizeof(buf));
+        int n = (int)read(sockfd, buf, sizeof(buf));
         if (n <= 0)
             return NULL;
 
-        if (0)
-            continue;
+        pthread_mutex_lock(&display_mutex);
 
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n; ) {
             char c = buf[i];
-            if (c == '\n' || (c >= 32 && c < 127))
+
+            /* Swallow CR/LF after a dropped prompt (handles split across reads too) */
+            if (skip_nl) {
+                if (c == '\r') {
+                    if (i + 1 < n && buf[i + 1] == '\n') i += 2;
+                    else i += 1;
+                    continue;
+                }
+                if (c == '\n') {
+                    i += 1;
+                    continue;
+                }
+                skip_nl = 0; /* first non-newline ends skipping */
+            }
+
+            /* CR / CRLF */
+            if (c == '\r') {
+                recv_putc_buf('\n');
+                line_start = 1;
+                if (i + 1 < n && buf[i + 1] == '\n') i += 2;
+                else i += 1;
+                continue;
+            }
+
+            /* LF */
+            if (c == '\n') {
+                recv_putc_buf('\n');
+                line_start = 1;
+                i += 1;
+                continue;
+            }
+
+            /* Drop "<IP:PORT>" anywhere; if it was trailing after text, newline once */
+            if (c == '<') {
+                int consumed = 0;
+                if (is_ip_prompt(&buf[i], n - i, &consumed)) {
+                    if (!line_start) {
+                        recv_putc_buf('\n');
+                        line_start = 1;
+                    }
+                    i += consumed;
+                    skip_nl = 1; /* swallow immediate server CR/LF that follows prompt */
+                    continue;
+                }
+            }
+
+            /* Printable only */
+            if (c >= 32 && c < 127) {
                 recv_putc_buf(c);
+                line_start = 0;
+            }
+            i += 1;
         }
 
         redraw_recv();
+        redraw_input();
         pthread_mutex_unlock(&display_mutex);
     }
 }
@@ -260,7 +355,10 @@ int main(void)
 
     pthread_mutex_lock(&display_mutex);
     clear_region(0, MAX_ROWS - 1);
+    draw_borders();
     draw_separator();
+
+    fbputs("CSEE 4840 Chat Client", 2, 20);
 
     for (int r = 0; r < RECV_ROWS; r++)
         memset(recv_buf[r], ' ', MAX_COLS);
@@ -286,8 +384,7 @@ int main(void)
     serv.sin_port = htons(SERVER_PORT);
     inet_pton(AF_INET, SERVER_HOST, &serv.sin_addr);
 
-    if (connect(sockfd, (struct sockaddr *)&serv,
-                sizeof(serv)) < 0) {
+    if (connect(sockfd, (struct sockaddr *)&serv, sizeof(serv)) < 0) {
         fprintf(stderr, "connect failed\n");
         return 1;
     }
@@ -302,7 +399,7 @@ int main(void)
     uint64_t press_t = 0;
     uint64_t last_rep = 0;
     const uint64_t rep_delay = 400;
-    const uint64_t rep_rate = 60;
+    const uint64_t rep_rate  = 60;
 
     while (1) {
         int transferred;
@@ -314,6 +411,22 @@ int main(void)
             continue;
 
         uint64_t t = now_ms();
+
+        /* Always track current modifiers */
+        held_mod = p.modifiers;
+
+        /* Stop repeating if last_code is no longer held */
+        if (last_code) {
+            int still_down = 0;
+            for (int k = 0; k < 6; k++) {
+                if (p.keycode[k] == last_code) {
+                    still_down = 1;
+                    break;
+                }
+            }
+            if (!still_down)
+                last_code = 0;
+        }
 
         for (int i = 0; i < 6; i++) {
             uint8_t code = p.keycode[i];
@@ -327,26 +440,26 @@ int main(void)
 
             if (!was_down) {
                 last_code = code;
-                held_mod = p.modifiers;
                 press_t = t;
                 last_rep = t;
 
                 pthread_mutex_lock(&display_mutex);
 
-                if (code == KEY_ESC)
+                if (code == KEY_ESC) {
+                    pthread_mutex_unlock(&display_mutex);
                     goto done;
-                else if (code == KEY_ENTER)
-                 send_msg();
-                else if (code == KEY_BACKSPACE)
+                } else if (code == KEY_ENTER) {
+                    send_msg();
+                } else if (code == KEY_BACKSPACE) {
                     backspace_char();
-                else if (code == KEY_LEFT && cursor_pos > 0)
+                } else if (code == KEY_LEFT && cursor_pos > 0) {
                     cursor_pos--;
-                else if (code == KEY_RIGHT && cursor_pos < input_len)
+                } else if (code == KEY_RIGHT && cursor_pos < input_len) {
                     cursor_pos++;
-                else {
-                    char c = key_to_ascii(code, held_mod);
-                    if (c && c != '\n')
-                        insert_char(c);
+                } else {
+                    char ch = key_to_ascii(code, held_mod);
+                    if (ch && ch != '\n')
+                        insert_char(ch);
                 }
 
                 redraw_input();
@@ -364,16 +477,16 @@ int main(void)
 
             pthread_mutex_lock(&display_mutex);
 
-            if (last_code == KEY_BACKSPACE)
+            if (last_code == KEY_BACKSPACE) {
                 backspace_char();
-            else if (last_code == KEY_LEFT && cursor_pos > 0)
+            } else if (last_code == KEY_LEFT && cursor_pos > 0) {
                 cursor_pos--;
-            else if (last_code == KEY_RIGHT && cursor_pos < input_len)
+            } else if (last_code == KEY_RIGHT && cursor_pos < input_len) {
                 cursor_pos++;
-            else {
-                char c = key_to_ascii(last_code, held_mod);
-                if (c && c != '\n')
-                    insert_char(c);
+            } else {
+                char ch = key_to_ascii(last_code, held_mod);
+                if (ch && ch != '\n')
+                    insert_char(ch);
             }
 
             redraw_input();
@@ -386,3 +499,8 @@ done:
     pthread_join(network_thread, NULL);
     return 0;
 }
+EOF
+
+make clean
+make
+./lab2
